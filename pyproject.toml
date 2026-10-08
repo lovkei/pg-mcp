@@ -79,9 +79,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not integration and not e2e'"
 markers = [
     "integration: marks tests as integration tests (require database and API key)",
+    "unit: fast tests with no external dependencies",
+    "e2e: end-to-end tests exercising the MCP server over stdio",
 ]
 
 [tool.coverage.run]

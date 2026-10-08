@@ -467,12 +467,15 @@ curl http://localhost:9090/metrics
 
 **可用指标：**
 
-- `pg_mcp_queries_total` - 已处理的总查询数
-- `pg_mcp_query_duration_seconds` - 查询执行时间直方图
-- `pg_mcp_sql_generation_duration_seconds` - SQL 生成时间
-- `pg_mcp_sql_validation_failures_total` - 验证失败次数
-- `pg_mcp_database_errors_total` - 数据库错误数
-- `pg_mcp_llm_tokens_used_total` - LLM token 使用总数
+- `pg_mcp_query_requests_total` - 已处理的总查询数（按 status/database 标签）
+- `pg_mcp_query_duration_seconds` - 查询请求处理时间直方图
+- `pg_mcp_llm_calls_total` - LLM API 调用总数（按 operation 标签）
+- `pg_mcp_llm_latency_seconds` - LLM 调用延迟直方图
+- `pg_mcp_llm_tokens_used` - LLM token 使用总数
+- `pg_mcp_sql_rejected_total` - 安全校验拒绝次数（按 reason 标签）
+- `pg_mcp_db_connections_active` - 活跃数据库连接数
+- `pg_mcp_db_query_duration_seconds` - 数据库查询执行时间直方图
+- `pg_mcp_schema_cache_age_seconds` - Schema 缓存年龄
 
 ### 日志
 

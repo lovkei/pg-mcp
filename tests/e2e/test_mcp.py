@@ -8,6 +8,8 @@ import pytest
 
 from pg_mcp.server import lifespan, mcp, query
 
+pytestmark = [pytest.mark.e2e, pytest.mark.integration]
+
 
 class TestMCPServer:
     """E2E tests for MCP server functionality."""

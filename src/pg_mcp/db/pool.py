@@ -4,10 +4,15 @@ This module provides utilities for creating and managing asyncpg connection
 pools for PostgreSQL databases.
 """
 
+import asyncio
+import logging
+
 import asyncpg
 from asyncpg import Pool
 
 from pg_mcp.config.settings import DatabaseConfig
+
+logger = logging.getLogger(__name__)
 
 
 async def create_pool(config: DatabaseConfig) -> Pool:
@@ -79,7 +84,7 @@ async def create_pools(configs: list[DatabaseConfig]) -> dict[str, Pool]:
     return pools
 
 
-async def close_pools(pools: dict[str, Pool], timeout: float = 10.0) -> None:
+async def close_pools(pools: dict[str, Pool], grace_timeout: float = 10.0) -> None:
     """Close all connection pools gracefully.
 
     This function closes all pools and waits for all connections to be
@@ -88,25 +93,20 @@ async def close_pools(pools: dict[str, Pool], timeout: float = 10.0) -> None:
 
     Args:
         pools: Dictionary mapping database names to their pools.
-        timeout: Maximum time in seconds to wait for graceful shutdown
+        grace_timeout: Maximum time in seconds to wait for graceful shutdown
             before forcing termination. Default: 10.0 seconds.
 
     Example:
         >>> pools = await create_pools(configs)
         >>> # ... use pools ...
-        >>> await close_pools(pools, timeout=5.0)
+        >>> await close_pools(pools, grace_timeout=5.0)
     """
-    import asyncio
-    import logging
-
-    logger = logging.getLogger(__name__)
-
     for db_name, pool in pools.items():
         try:
             # Try graceful close with timeout
-            await asyncio.wait_for(pool.close(), timeout=timeout)
+            await asyncio.wait_for(pool.close(), timeout=grace_timeout)
             logger.info(f"Connection pool for '{db_name}' closed gracefully")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Force termination if graceful close times out
             logger.warning(
                 f"Graceful close timed out for '{db_name}', forcing termination"

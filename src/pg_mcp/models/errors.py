@@ -7,6 +7,8 @@ and error codes for structured error reporting.
 from enum import StrEnum
 from typing import Any
 
+from pydantic import BaseModel, Field, field_validator
+
 
 class ErrorCode(StrEnum):
     """Standardized error codes for the application."""
@@ -36,25 +38,30 @@ class ErrorCode(StrEnum):
     RESOURCE_EXHAUSTED = "resource_exhausted"
 
 
-class ErrorDetail:
-    """Structured error detail information."""
+class ErrorDetail(BaseModel):
+    """Structured error detail information (single canonical definition)."""
 
-    def __init__(
-        self,
-        code: ErrorCode,
-        message: str,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        """Initialize error detail.
+    code: ErrorCode = Field(..., description="Error code identifier")
+    message: str = Field(..., description="Human-readable error message")
+    details: dict[str, Any] | None = Field(default=None, description="Additional error context")
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def coerce_code(cls, v: ErrorCode | str) -> ErrorCode:
+        """Accept raw strings (e.g. from JSON) and coerce to ErrorCode.
 
         Args:
-            code: Error code identifier.
-            message: Human-readable error message.
-            details: Optional additional context.
+            v: Error code as ErrorCode or string.
+
+        Returns:
+            ErrorCode: The coerced enum value.
+
+        Raises:
+            ValueError: If the string is not a valid error code.
         """
-        self.code = code
-        self.message = message
-        self.details = details or {}
+        if isinstance(v, str):
+            return ErrorCode(v)
+        return v
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary representation.
@@ -63,20 +70,12 @@ class ErrorDetail:
             dict: Dictionary containing error information.
         """
         result: dict[str, Any] = {
-            "code": self.code,
+            "code": self.code.value,
             "message": self.message,
         }
         if self.details:
             result["details"] = self.details
         return result
-
-    def __repr__(self) -> str:
-        """String representation of error detail.
-
-        Returns:
-            str: String representation.
-        """
-        return f"ErrorDetail(code={self.code}, message={self.message!r})"
 
 
 class PgMcpError(Exception):
@@ -200,6 +199,7 @@ class LLMError(PgMcpError):
         message: str,
         code: ErrorCode = ErrorCode.LLM_ERROR,
         details: dict[str, Any] | None = None,
+        retryable: bool = False,
     ) -> None:
         """Initialize LLM error.
 
@@ -207,21 +207,29 @@ class LLMError(PgMcpError):
             message: Error message describing LLM failure.
             code: Specific LLM error code.
             details: Optional LLM error details.
+            retryable: Whether the failure is transient (timeout, 5xx, rate limit)
+                and a retry with backoff may succeed.
         """
         super().__init__(message=message, code=code, details=details)
+        self.retryable = retryable
 
 
 class LLMTimeoutError(LLMError):
     """Exception raised when LLM request times out."""
 
-    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, message: str, details: dict[str, Any] | None = None, retryable: bool = True
+    ) -> None:
         """Initialize LLM timeout error.
 
         Args:
             message: Error message describing timeout.
             details: Optional timeout details (e.g., duration).
+            retryable: Whether a retry may succeed (defaults True - timeouts are transient).
         """
-        super().__init__(message=message, code=ErrorCode.LLM_TIMEOUT, details=details)
+        super().__init__(
+            message=message, code=ErrorCode.LLM_TIMEOUT, details=details, retryable=retryable
+        )
 
 
 class LLMUnavailableError(LLMError):
@@ -233,14 +241,19 @@ class LLMUnavailableError(LLMError):
     - Service temporarily down
     """
 
-    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, message: str, details: dict[str, Any] | None = None, retryable: bool = True
+    ) -> None:
         """Initialize LLM unavailable error.
 
         Args:
             message: Error message describing unavailability.
             details: Optional unavailability details.
+            retryable: Whether a retry may succeed (defaults True - transient outages).
         """
-        super().__init__(message=message, code=ErrorCode.LLM_UNAVAILABLE, details=details)
+        super().__init__(
+            message=message, code=ErrorCode.LLM_UNAVAILABLE, details=details, retryable=retryable
+        )
 
 
 class SchemaLoadError(PgMcpError):

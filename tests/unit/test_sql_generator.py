@@ -284,6 +284,7 @@ class TestSQLGenerator:
         mock_response.choices = [
             MagicMock(message=MagicMock(content="```sql\nSELECT * FROM users;\n```"))
         ]
+        mock_response.usage = None
 
         # Use AsyncMock for async method
         with patch.object(
@@ -302,7 +303,27 @@ class TestSQLGenerator:
             assert call_kwargs["messages"][1]["role"] == "user"
 
             # Verify result
-            assert result == "SELECT * FROM users;"
+            assert result.sql == "SELECT * FROM users;"
+            # No usage info in the response -> tokens_used is None
+            assert result.tokens_used is None
+
+    @pytest.mark.asyncio
+    async def test_generate_extracts_token_usage(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Test token usage is extracted from the response."""
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="```sql\nSELECT 1;\n```"))
+        ]
+        mock_response.usage = MagicMock(total_tokens=1234)
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
+        ):
+            result = await generator.generate("Test", mock_schema)
+
+            assert result.tokens_used == 1234
 
     @pytest.mark.asyncio
     async def test_generate_with_context(
@@ -317,6 +338,7 @@ class TestSQLGenerator:
                 )
             )
         ]
+        mock_response.usage = None
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -327,8 +349,8 @@ class TestSQLGenerator:
                 context="Only count users with status='active'",
             )
 
-            assert "SELECT COUNT(*)" in result
-            assert result.endswith(";")
+            assert "SELECT COUNT(*)" in result.sql
+            assert result.sql.endswith(";")
 
     @pytest.mark.asyncio
     async def test_generate_with_retry_context(
@@ -339,6 +361,7 @@ class TestSQLGenerator:
         mock_response.choices = [
             MagicMock(message=MagicMock(content="```sql\nSELECT COUNT(*) FROM users;\n```"))
         ]
+        mock_response.usage = None
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -356,17 +379,23 @@ class TestSQLGenerator:
             assert "SELECT COUNT(*) FROM user" in user_prompt
             assert 'relation "user" does not exist' in user_prompt
 
-            assert result == "SELECT COUNT(*) FROM users;"
+            assert result.sql == "SELECT COUNT(*) FROM users;"
 
     @pytest.mark.asyncio
-    async def test_generate_handles_llm_timeout(
+    async def test_generate_handles_openai_timeout(
         self, generator: SQLGenerator, mock_schema: DatabaseSchema
     ) -> None:
-        """Test LLM timeout error handling."""
+        """Test openai.APITimeoutError maps to LLMTimeoutError.
+
+        Regression test: openai.APITimeoutError does NOT inherit the built-in
+        TimeoutError, so the old `except TimeoutError` branch was dead code.
+        """
+        import openai
+
         with patch.object(
             generator.client.chat.completions,
             "create",
-            new=AsyncMock(side_effect=TimeoutError("Request timed out")),
+            new=AsyncMock(side_effect=openai.APITimeoutError(request=MagicMock())),
         ):
             with pytest.raises(LLMTimeoutError) as exc_info:
                 await generator.generate("Count users", mock_schema)
@@ -375,34 +404,63 @@ class TestSQLGenerator:
             assert exc_info.value.details["timeout"] == 30.0
 
     @pytest.mark.asyncio
-    async def test_generate_handles_authentication_error(
+    async def test_generate_handles_llm_timeout(
         self, generator: SQLGenerator, mock_schema: DatabaseSchema
     ) -> None:
-        """Test authentication error handling."""
+        """Test built-in TimeoutError still maps to LLMTimeoutError via the generic branch."""
         with patch.object(
             generator.client.chat.completions,
             "create",
-            new=AsyncMock(side_effect=Exception("Authentication failed - invalid api_key")),
+            new=AsyncMock(side_effect=TimeoutError("Request timed out")),
+        ):
+            with pytest.raises(LLMError) as exc_info:
+                await generator.generate("Count users", mock_schema)
+
+            assert "request failed" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_generate_handles_authentication_error(
+        self, generator: SQLGenerator, mock_schema: DatabaseSchema
+    ) -> None:
+        """Test openai.AuthenticationError maps to non-retryable LLMUnavailableError."""
+        import openai
+
+        error = openai.AuthenticationError(
+            message="Invalid API key",
+            response=MagicMock(status_code=401, headers={}),
+            body=None,
+        )
+
+        with patch.object(
+            generator.client.chat.completions, "create", new=AsyncMock(side_effect=error)
         ):
             with pytest.raises(LLMUnavailableError) as exc_info:
                 await generator.generate("Count users", mock_schema)
 
             assert "authentication" in str(exc_info.value).lower()
+            assert exc_info.value.retryable is False
 
     @pytest.mark.asyncio
     async def test_generate_handles_rate_limit_error(
         self, generator: SQLGenerator, mock_schema: DatabaseSchema
     ) -> None:
-        """Test rate limit error handling."""
+        """Test openai.RateLimitError maps to retryable LLMUnavailableError."""
+        import openai
+
+        error = openai.RateLimitError(
+            message="Rate limit exceeded",
+            response=MagicMock(status_code=429, headers={}),
+            body=None,
+        )
+
         with patch.object(
-            generator.client.chat.completions,
-            "create",
-            new=AsyncMock(side_effect=Exception("rate_limit exceeded")),
+            generator.client.chat.completions, "create", new=AsyncMock(side_effect=error)
         ):
             with pytest.raises(LLMUnavailableError) as exc_info:
                 await generator.generate("Count users", mock_schema)
 
             assert "rate limit" in str(exc_info.value).lower()
+            assert exc_info.value.retryable is True
 
     @pytest.mark.asyncio
     async def test_generate_handles_empty_response(
@@ -473,6 +531,7 @@ LIMIT 10;"""
 
         mock_response = MagicMock()
         mock_response.choices = [MagicMock(message=MagicMock(content=f"```sql\n{cte_sql}\n```"))]
+        mock_response.usage = None
 
         with patch.object(
             generator.client.chat.completions, "create", new=AsyncMock(return_value=mock_response)
@@ -481,8 +540,8 @@ LIMIT 10;"""
                 "Show top 10 users by order count in last 30 days", mock_schema
             )
 
-            assert result.startswith("WITH recent_orders")
-            assert "LIMIT 10;" in result
+            assert result.sql.startswith("WITH recent_orders")
+            assert "LIMIT 10;" in result.sql
 
     @pytest.mark.asyncio
     async def test_generate_respects_config_settings(self, mock_schema: DatabaseSchema) -> None:
@@ -544,4 +603,3 @@ LIMIT 10;"""
                 await generator.generate("Count users", mock_schema)
 
             assert "OpenAI API request failed" in str(exc_info.value)
-            assert exc_info.value.details["error"] == "Unknown error occurred"

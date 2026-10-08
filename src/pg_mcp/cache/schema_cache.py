@@ -8,12 +8,16 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from asyncpg import Pool
 
 from pg_mcp.config.settings import CacheConfig
 from pg_mcp.db.introspection import SchemaIntrospector
 from pg_mcp.models.schema import DatabaseSchema
+
+if TYPE_CHECKING:
+    from pg_mcp.observability.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +38,15 @@ class SchemaCache:
         >>> await cache.start_auto_refresh(60, pools)  # Refresh every 60 minutes
     """
 
-    def __init__(self, config: CacheConfig):
+    def __init__(self, config: CacheConfig, metrics_collector: "MetricsCollector | None" = None):
         """Initialize schema cache.
 
         Args:
             config: Cache configuration with TTL and size limits.
+            metrics_collector: Optional metrics collector for cache-age gauge.
         """
         self.config = config
+        self.metrics_collector = metrics_collector
         self._cache: dict[str, DatabaseSchema] = {}
         self._cache_timestamps: dict[str, datetime] = {}
         self._refresh_task: asyncio.Task[None] | None = None
@@ -74,6 +80,9 @@ class SchemaCache:
             self._cache.pop(database_name, None)
             self._cache_timestamps.pop(database_name, None)
             return None
+
+        if self.metrics_collector is not None:
+            self.metrics_collector.set_schema_cache_age(database_name, cache_age)
 
         return self._cache[database_name]
 

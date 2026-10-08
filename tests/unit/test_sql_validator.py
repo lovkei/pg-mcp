@@ -10,10 +10,17 @@ Tests cover:
 """
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
 from pg_mcp.services.sql_validator import SQLValidator
+
+
+def sqlglot_parse_one(sql: str):
+    """Parse a single SQL statement via sqlglot (used by AST-construction tests)."""
+    return sqlglot.parse_one(sql, read="postgres")
 
 
 class TestValidStatements:
@@ -477,7 +484,7 @@ class TestExplainStatements:
         assert error is None
 
     def test_explain_analyze_allowed(self) -> None:
-        """Test EXPLAIN ANALYZE is allowed when EXPLAIN is enabled."""
+        """Test EXPLAIN ANALYZE SELECT is allowed when EXPLAIN is enabled."""
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
@@ -486,21 +493,136 @@ class TestExplainStatements:
         assert is_valid
         assert error is None
 
-    def test_explain_with_dangerous_query_allowed(self) -> None:
-        """Test EXPLAIN with dangerous underlying query is allowed.
+    def test_explain_delete_rejected(self) -> None:
+        """Test EXPLAIN DELETE is rejected even when EXPLAIN is enabled.
 
-        EXPLAIN only shows query plans and doesn't execute the query,
-        so even "EXPLAIN DELETE" is safe as it won't modify data.
+        EXPLAIN ANALYZE (and options like (ANALYZE true)) actually execute
+        the inner statement, so the inner query must pass full validation.
         """
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
-        # EXPLAIN DELETE is safe - it only shows the execution plan
         sql = "EXPLAIN DELETE FROM users"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None
+        assert "DELETE" in error
+
+    def test_explain_analyze_delete_rejected(self) -> None:
+        """Test EXPLAIN ANALYZE DELETE is rejected - ANALYZE executes the inner statement."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN ANALYZE DELETE FROM users"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None
+        assert "DELETE" in error
+
+    def test_explain_blocked_table_rejected(self) -> None:
+        """Test EXPLAIN over a blocked table is rejected (EXPLAIN executes the plan)."""
+        config = SecurityConfig()
+        validator = SQLValidator(
+            config=config, allow_explain=True, blocked_tables=["users"]
+        )
+
+        sql = "EXPLAIN SELECT * FROM users"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None
+        assert "users" in error
+
+    def test_explain_blocked_function_rejected(self) -> None:
+        """Test EXPLAIN over a blocked function is rejected."""
+        config = SecurityConfig(blocked_functions=["pg_sleep"])
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN ANALYZE SELECT pg_sleep(10)"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None
+        assert "pg_sleep" in error
+
+    def test_explain_with_options_prefix(self) -> None:
+        """Test EXPLAIN (ANALYZE, FORMAT JSON) prefix parsing."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM users"
         is_valid, error = validator.validate(sql)
         assert is_valid
         assert error is None
 
+    def test_explain_verbose_prefix(self) -> None:
+        """Test EXPLAIN VERBOSE prefix parsing."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN VERBOSE SELECT 1"
+        is_valid, error = validator.validate(sql)
+        assert is_valid
+        assert error is None
+
+
+class TestBlockedTableQualifiedName:
+    """Test schema-qualified blocked table matching."""
+
+    def test_bare_config_blocks_bare_reference(self) -> None:
+        """Test bare config entry blocks bare table reference."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["users"])
+        is_valid, error = validator.validate("SELECT * FROM users")
+        assert not is_valid
+        assert error is not None and "users" in error
+
+    def test_bare_config_blocks_qualified_reference(self) -> None:
+        """Test bare config entry blocks schema-qualified reference."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["users"])
+        is_valid, error = validator.validate("SELECT * FROM public.users")
+        assert not is_valid
+        assert error is not None and "public.users" in error
+
+    def test_bare_config_blocks_other_schema(self) -> None:
+        """Test bare config entry blocks the table in any schema."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["users"])
+        is_valid, _error = validator.validate("SELECT * FROM private.users")
+        assert not is_valid
+
+    def test_qualified_config_blocks_qualified_reference(self) -> None:
+        """Test qualified config entry blocks the qualified form."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["public.users"])
+        is_valid, error = validator.validate("SELECT * FROM public.users")
+        assert not is_valid
+        assert error is not None and "public.users" in error
+
+    def test_qualified_config_allows_other_schema(self) -> None:
+        """Test qualified config entry allows the same table in another schema."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["public.users"])
+        is_valid, error = validator.validate("SELECT * FROM private.users")
+        assert is_valid
+        assert error is None
+
+    def test_qualified_config_allows_other_table_in_same_schema(self) -> None:
+        """Test qualified config entry allows other tables in the same schema."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["public.users"])
+        is_valid, error = validator.validate("SELECT * FROM public.orders")
+        assert is_valid
+        assert error is None
+
+    def test_blocked_table_in_join(self) -> None:
+        """Test blocked table detected in a join."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["secrets"])
+        sql = "SELECT u.id FROM users u JOIN secrets s ON u.id = s.user_id"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None and "secrets" in error
+
+    def test_blocked_table_in_subquery(self) -> None:
+        """Test blocked table detected inside a subquery."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["secrets"])
+        sql = "SELECT id FROM users WHERE id IN (SELECT user_id FROM secrets)"
+        is_valid, error = validator.validate(sql)
+        assert not is_valid
+        assert error is not None and "secrets" in error
 
 class TestValidatorHelperMethods:
     """Test validator helper methods like normalize_sql and extract_tables."""
@@ -570,6 +692,163 @@ class TestValidatorHelperMethods:
         sql = "INVALID SQL QUERY"
         with pytest.raises(SQLParseError):
             validator.extract_tables(sql)
+
+
+class TestMetricsInstrumentation:
+    """Test that rejections are recorded via the metrics collector."""
+
+    def _fresh_metrics(self):
+        from prometheus_client import REGISTRY
+
+        from pg_mcp.observability.metrics import MetricsCollector
+
+        for coll in list(REGISTRY._collector_to_names):
+            REGISTRY.unregister(coll)
+        MetricsCollector._instance = None
+        return MetricsCollector()
+
+    def test_rejection_increments_metric(self) -> None:
+        """A rejected statement increments sql_rejected with the right reason."""
+        metrics = self._fresh_metrics()
+        validator = SQLValidator(SecurityConfig(), metrics_collector=metrics)
+
+        with pytest.raises(SecurityViolationError):
+            validator.validate_or_raise("DELETE FROM users")
+
+        assert metrics.sql_rejected.labels(reason="statement_type")._value.get() == 1
+
+    def test_parse_error_increments_metric(self) -> None:
+        """A parse failure increments sql_rejected with reason=parse_error."""
+        metrics = self._fresh_metrics()
+        validator = SQLValidator(SecurityConfig(), metrics_collector=metrics)
+
+        with pytest.raises(SQLParseError):
+            validator.validate_or_raise("SELECT * FROM WHERE")
+
+        assert metrics.sql_rejected.labels(reason="parse_error")._value.get() == 1
+
+    def test_no_metrics_does_not_crash(self) -> None:
+        """Rejections work without a metrics collector (None)."""
+        validator = SQLValidator(SecurityConfig())
+        with pytest.raises(SecurityViolationError):
+            validator.validate_or_raise("DROP TABLE users")
+
+
+class TestCommandStatements:
+    """Test non-EXPLAIN commands and degenerate EXPLAIN forms."""
+
+    def test_vacuum_rejected(self) -> None:
+        """VACUUM parses as Command and is rejected."""
+        validator = SQLValidator(SecurityConfig())
+        is_valid, error = validator.validate("VACUUM users")
+        assert not is_valid
+        assert error is not None and "VACUUM" in error
+
+    def test_explain_without_inner_rejected(self) -> None:
+        """Bare EXPLAIN (no inner statement) raises a parse error.
+
+        Regression: the old prefix regex required trailing whitespace, so a
+        bare "EXPLAIN" kept its prefix and recursed infinitely on re-validation.
+        """
+        validator = SQLValidator(SecurityConfig(), allow_explain=True)
+        with pytest.raises(SQLParseError, match="no statement to explain"):
+            validator.validate_or_raise("EXPLAIN")
+
+    def test_empty_statement_list_rejected(self) -> None:
+        """A parse result with no statements raises a parse error."""
+        validator = SQLValidator(SecurityConfig())
+        with pytest.raises(SQLParseError):
+            validator.validate_or_raise("/* only a comment block */")
+
+    def test_no_statement_found_branch(self, monkeypatch) -> None:
+        """A parse result of [] raises the 'No valid SQL statement' error."""
+        validator = SQLValidator(SecurityConfig())
+        monkeypatch.setattr(
+            "pg_mcp.services.sql_validator.sqlglot.parse", lambda *a, **k: []
+        )
+        with pytest.raises(SQLParseError, match="No valid SQL statement found"):
+            validator.validate_or_raise("SELECT 1")
+
+    def test_empty_name_table_skipped(self) -> None:
+        """Tables with empty names (e.g. generate_series) don't crash blocking."""
+        validator = SQLValidator(SecurityConfig(), blocked_tables=["users"])
+        is_valid, error = validator.validate("SELECT * FROM generate_series(1, 3)")
+        assert is_valid
+        assert error is None
+
+
+class TestSubquerySafetyBranches:
+    """Test subquery safety checks via constructed AST nodes.
+
+    sqlglot cannot parse a Subquery wrapping a non-SELECT statement, so these
+    tests patch sqlglot.parse to return a valid SELECT with a hostile subquery
+    attached. This simulates adversarial AST construction directly.
+    """
+
+    def _select_with_subquery(self, subquery_this: exp.Expression) -> exp.Select:
+        """Build a SELECT whose projection is a Subquery wrapping subquery_this."""
+        select = sqlglot_parse_one("SELECT 1")
+        select.set("expressions", [exp.Subquery(this=subquery_this)])
+        return select
+
+    def test_forbidden_statement_in_subquery(self, monkeypatch) -> None:
+        """A DELETE wrapped in a subquery is rejected."""
+        validator = SQLValidator(SecurityConfig())
+        select = self._select_with_subquery(
+            exp.Delete(this=exp.Table(this=exp.to_identifier("users")))
+        )
+        monkeypatch.setattr(
+            "pg_mcp.services.sql_validator.sqlglot.parse",
+            lambda *a, **k: [select],
+        )
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise("SELECT (DELETE FROM users)")
+        assert "DELETE statements in subqueries" in str(exc_info.value)
+
+    def test_non_select_in_subquery(self, monkeypatch) -> None:
+        """A subquery wrapping a non-SELECT expression is rejected."""
+        validator = SQLValidator(SecurityConfig())
+        select = self._select_with_subquery(exp.Literal.number(1))
+        monkeypatch.setattr(
+            "pg_mcp.services.sql_validator.sqlglot.parse",
+            lambda *a, **k: [select],
+        )
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise("SELECT (1)")
+        assert "Subqueries must contain only SELECT" in str(exc_info.value)
+
+
+class TestWithStatementBranches:
+    """Test top-level WITH statement handling via constructed AST nodes.
+
+    sqlglot folds WITH into the following Select, so the exp.With branch is
+    only reachable with a manually constructed node.
+    """
+
+    def test_with_main_query_validated(self, monkeypatch) -> None:
+        """A top-level WITH with a main query validates the main query."""
+        from unittest.mock import patch
+
+        validator = SQLValidator(SecurityConfig())
+        main_query = sqlglot_parse_one("SELECT 1")
+        with_node = exp.With(this=main_query, expressions=[])
+        with patch(
+            "pg_mcp.services.sql_validator.sqlglot.parse", return_value=[with_node]
+        ):
+            is_valid, error = validator.validate("WITH c AS (SELECT 1) SELECT * FROM c")
+        assert is_valid
+        assert error is None
+
+    def test_with_without_main_query_rejected(self, monkeypatch) -> None:
+        """A WITH with no main query raises a parse error."""
+        validator = SQLValidator(SecurityConfig())
+        with_node = exp.With(this=None, expressions=[])
+        monkeypatch.setattr(
+            "pg_mcp.services.sql_validator.sqlglot.parse",
+            lambda *a, **k: [with_node],
+        )
+        with pytest.raises(SQLParseError, match="WITH statement has no main query"):
+            validator.validate_or_raise("WITH c AS (SELECT 1)")
 
 
 class TestCTEWithDangerousOperations:

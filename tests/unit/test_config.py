@@ -157,7 +157,6 @@ class TestSecurityConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = SecurityConfig()
-        assert config.allow_write_operations is False
         assert config.max_rows == 10000
         assert config.max_execution_time == 30.0
         assert "pg_sleep" in config.blocked_functions
@@ -179,10 +178,38 @@ class TestSecurityConfig:
         assert "func2" in config.blocked_functions
         assert "func3" in config.blocked_functions
 
-    def test_allow_write_operations(self) -> None:
-        """Test enabling write operations."""
-        config = SecurityConfig(allow_write_operations=True)
-        assert config.allow_write_operations is True
+    def test_blocked_tables_and_columns(self) -> None:
+        """Test blocked tables and columns configuration."""
+        config = SecurityConfig(
+            blocked_tables=["users", "public.secrets"],
+            blocked_columns=["users.password_hash"],
+        )
+        assert config.blocked_tables == ["users", "public.secrets"]
+        assert config.blocked_columns == ["users.password_hash"]
+
+    def test_parse_blocked_tables_from_string(self) -> None:
+        """Test parsing blocked tables from comma-separated string."""
+        config = SecurityConfig(
+            blocked_tables="users, orders,audit_log",  # type: ignore
+        )
+        assert config.blocked_tables == ["users", "orders", "audit_log"]
+
+    def test_parse_blocked_columns_from_string(self) -> None:
+        """Test parsing blocked columns from comma-separated string."""
+        config = SecurityConfig(
+            blocked_columns="users.password, orders.total",  # type: ignore
+        )
+        assert config.blocked_columns == ["users.password", "orders.total"]
+
+    def test_allow_explain_defaults_off(self) -> None:
+        """Test EXPLAIN is denied by default."""
+        config = SecurityConfig()
+        assert config.allow_explain is False
+
+    def test_allow_explain_enabled(self) -> None:
+        """Test EXPLAIN can be explicitly enabled."""
+        config = SecurityConfig(allow_explain=True)
+        assert config.allow_explain is True
 
     def test_invalid_max_rows(self) -> None:
         """Test invalid max_rows is rejected."""
@@ -199,25 +226,33 @@ class TestValidationConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = ValidationConfig()
-        assert config.max_question_length == 10000
-        assert config.min_confidence_score == 70
+        assert config.confidence_threshold == 70
+        assert config.max_regeneration_attempts == 2
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = ValidationConfig(
-            max_question_length=5000,
-            min_confidence_score=80,
+            confidence_threshold=80,
+            max_regeneration_attempts=3,
         )
-        assert config.max_question_length == 5000
-        assert config.min_confidence_score == 80
+        assert config.confidence_threshold == 80
+        assert config.max_regeneration_attempts == 3
 
     def test_invalid_confidence_score(self) -> None:
         """Test invalid confidence score is rejected."""
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=-1)
+            ValidationConfig(confidence_threshold=-1)
 
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=101)
+            ValidationConfig(confidence_threshold=101)
+
+    def test_invalid_regeneration_attempts(self) -> None:
+        """Test invalid max_regeneration_attempts is rejected."""
+        with pytest.raises(ValidationError):
+            ValidationConfig(max_regeneration_attempts=-1)
+
+        with pytest.raises(ValidationError):
+            ValidationConfig(max_regeneration_attempts=6)
 
 
 class TestCacheConfig:
@@ -227,18 +262,15 @@ class TestCacheConfig:
         """Test default configuration values."""
         config = CacheConfig()
         assert config.schema_ttl == 3600
-        assert config.max_size == 100
         assert config.enabled is True
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = CacheConfig(
             schema_ttl=7200,
-            max_size=200,
             enabled=False,
         )
         assert config.schema_ttl == 7200
-        assert config.max_size == 200
         assert config.enabled is False
 
     def test_invalid_ttl(self) -> None:
@@ -261,6 +293,9 @@ class TestResilienceConfig:
         assert config.backoff_factor == 2.0
         assert config.circuit_breaker_threshold == 5
         assert config.circuit_breaker_timeout == 60.0
+        assert config.max_concurrent_queries == 10
+        assert config.max_concurrent_llm_calls == 5
+        assert config.rate_limit_timeout == 5.0
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -268,10 +303,16 @@ class TestResilienceConfig:
             max_retries=5,
             retry_delay=2.0,
             backoff_factor=3.0,
+            max_concurrent_queries=20,
+            max_concurrent_llm_calls=10,
+            rate_limit_timeout=10.0,
         )
         assert config.max_retries == 5
         assert config.retry_delay == 2.0
         assert config.backoff_factor == 3.0
+        assert config.max_concurrent_queries == 20
+        assert config.max_concurrent_llm_calls == 10
+        assert config.rate_limit_timeout == 10.0
 
     def test_invalid_values(self) -> None:
         """Test invalid values are rejected."""
@@ -280,6 +321,12 @@ class TestResilienceConfig:
 
         with pytest.raises(ValidationError):
             ResilienceConfig(backoff_factor=0.5)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(max_concurrent_queries=0)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(rate_limit_timeout=0.05)
 
 
 class TestObservabilityConfig:
@@ -360,12 +407,116 @@ class TestSettings:
                 port=5433,
             ),
             security=SecurityConfig(
-                allow_write_operations=True,
+                blocked_tables=["secrets"],
             ),
         )
         assert settings.database.host == "custom.host"
         assert settings.database.port == 5433
-        assert settings.security.allow_write_operations is True
+        assert settings.security.blocked_tables == ["secrets"]
+
+
+class TestSettingsMultiDatabase:
+    """Tests for multi-database configuration."""
+
+    def test_effective_databases_fallback_to_single(self) -> None:
+        """Test effective_databases falls back to the single database."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="blog_small"),
+        )
+        assert settings.databases == []
+        assert settings.effective_databases == [settings.database]
+        assert settings.effective_databases[0].name == "blog_small"
+
+    def test_effective_databases_uses_explicit_list(self) -> None:
+        """Test effective_databases returns the explicit list when set."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="default_db", _env_file=None),
+            databases=[
+                DatabaseConfig(name="blog_small"),
+                DatabaseConfig(name="analytics"),
+            ],
+        )
+        names = [db.name for db in settings.effective_databases]
+        assert names == ["blog_small", "analytics"]
+        # When the explicit list is set, the single database is not served
+        assert "default_db" not in names
+
+    def test_databases_parsed_from_environment(self) -> None:
+        """Test PG_MCP_DATABASES__N__NAME env vars build the database list."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="default_db", _env_file=None),
+            _env_file=None,
+            databases=[
+                {"name": "blog_small", "host": "db1.host"},
+                {"name": "analytics", "host": "db2.host"},
+            ],
+        )
+        assert [db.name for db in settings.databases] == ["blog_small", "analytics"]
+        assert settings.databases[0].host == "db1.host"
+        assert settings.databases[1].host == "db2.host"
+
+    def test_databases_env_json_array(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test PG_MCP_DATABASES JSON array env var builds the database list."""
+        monkeypatch.setenv(
+            "PG_MCP_DATABASES",
+            '[{"name": "blog_small", "host": "db1.host"},'
+            ' {"name": "analytics", "host": "db2.host"}]',
+        )
+
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="default_db", _env_file=None),
+            _env_file=None,
+        )
+
+        assert [db.name for db in settings.effective_databases] == ["blog_small", "analytics"]
+        assert settings.effective_databases[0].host == "db1.host"
+        assert settings.effective_databases[1].host == "db2.host"
+
+    def test_databases_env_entries_inherit_shared_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test list entries pick up shared DATABASE_* credentials, name distinguishes them."""
+        monkeypatch.setenv("DATABASE_HOST", "shared.host")
+        monkeypatch.setenv(
+            "PG_MCP_DATABASES",
+            '[{"name": "blog_small"}, {"name": "analytics"}]',
+        )
+
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="default_db", _env_file=None),
+            _env_file=None,
+        )
+
+        # Shared credentials inherited from DATABASE_* env vars
+        assert settings.effective_databases[0].host == "shared.host"
+        assert settings.effective_databases[1].host == "shared.host"
+        # Names distinguish the entries
+        assert [db.name for db in settings.effective_databases] == ["blog_small", "analytics"]
+
+    def test_duplicate_database_names_rejected(self) -> None:
+        """Test duplicate database names in the list are rejected."""
+        with pytest.raises(ValidationError, match="Duplicate database names"):
+            Settings(
+                openai=OpenAIConfig(api_key="sk-test"),
+                databases=[
+                    DatabaseConfig(name="blog_small"),
+                    DatabaseConfig(name="blog_small"),
+                ],
+            )
+
+    def test_duplicate_with_single_database_rejected(self) -> None:
+        """Test a database list entry duplicating the single database is rejected."""
+        with pytest.raises(ValidationError, match="Duplicate database names"):
+            Settings(
+                openai=OpenAIConfig(api_key="sk-test"),
+                database=DatabaseConfig(name="blog_small"),
+                databases=[DatabaseConfig(name="blog_small")],
+            )
 
 
 class TestSettingsGlobalInstance:

@@ -9,6 +9,18 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from pg_mcp.models.errors import ErrorDetail
+
+__all__ = [
+    "ErrorDetail",
+    "QueryRequest",
+    "QueryResponse",
+    "QueryResult",
+    "ResultValidationResult",
+    "ReturnType",
+    "ValidationResult",
+]
+
 
 class ReturnType(StrEnum):
     """Type of return value requested by the client."""
@@ -64,7 +76,9 @@ class ValidationResult(BaseModel):
     uses_blocked_functions: list[str] = Field(
         default_factory=list, description="List of blocked functions found in SQL"
     )
-    error_message: str | None = Field(None, description="Validation error message if invalid")
+    error_message: str | None = Field(
+        default=None, description="Validation error message if invalid"
+    )
 
     @property
     def is_safe(self) -> bool:
@@ -96,7 +110,9 @@ class ResultValidationResult(BaseModel):
         description="Confidence score (0-100) that results match the question",
     )
     explanation: str = Field(..., description="Explanation of the validation assessment")
-    suggestion: str | None = Field(None, description="Optional suggestion for improving the query")
+    suggestion: str | None = Field(
+        default=None, description="Optional suggestion for improving the query"
+    )
     is_acceptable: bool = Field(
         ..., description="Whether results are acceptable based on confidence threshold"
     )
@@ -136,26 +152,22 @@ class QueryResult(BaseModel):
         return self.model_dump()
 
 
-class ErrorDetail(BaseModel):
-    """Detailed error information."""
-
-    code: str = Field(..., description="Error code identifier")
-    message: str = Field(..., description="Human-readable error message")
-    details: dict[str, Any] | None = Field(None, description="Additional error context")
-
-
 class QueryResponse(BaseModel):
     """Complete query response to client."""
 
     success: bool = Field(..., description="Whether query succeeded")
-    generated_sql: str | None = Field(None, description="Generated SQL query")
-    validation: ValidationResult | None = Field(None, description="SQL validation results")
-    data: QueryResult | None = Field(None, description="Query result data (if executed)")
-    error: ErrorDetail | None = Field(None, description="Error information if failed")
+    generated_sql: str | None = Field(default=None, description="Generated SQL query")
+    validation: ValidationResult | None = Field(default=None, description="SQL validation results")
+    data: QueryResult | None = Field(default=None, description="Query result data (if executed)")
+    error: ErrorDetail | None = Field(default=None, description="Error information if failed")
     confidence: int = Field(
         default=100, ge=0, le=100, description="Confidence score of generated SQL (0-100)"
     )
-    tokens_used: int | None = Field(None, ge=0, description="LLM tokens used for generation")
+    tokens_used: int | None = Field(
+        default=None, ge=0, description="LLM tokens used for generation"
+    )
+    request_id: str | None = Field(default=None, description="Unique request trace ID")
+    warning: str | None = Field(default=None, description="Warning message (e.g., low confidence)")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert response to dictionary for MCP tool return.

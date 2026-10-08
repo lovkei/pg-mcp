@@ -6,7 +6,7 @@ project `.env` file with sensible defaults.
 """
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -86,9 +86,6 @@ class SecurityConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="SECURITY_", env_file=_ENV_FILE, extra="ignore")
 
-    allow_write_operations: bool = Field(
-        default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
-    )
     blocked_functions: list[str] = Field(
         default_factory=lambda: [
             "pg_sleep",
@@ -98,6 +95,17 @@ class SecurityConfig(BaseSettings):
             "lo_export",
         ],
         description="List of blocked PostgreSQL functions",
+    )
+    blocked_tables: list[str] = Field(
+        default_factory=list,
+        description="Blocked tables ('name' or 'schema.name'), denied in generated SQL",
+    )
+    blocked_columns: list[str] = Field(
+        default_factory=list,
+        description="Blocked columns ('table.column' or 'schema.table.column')",
+    )
+    allow_explain: bool = Field(
+        default=False, description="Allow EXPLAIN statements (inner statement still validated)"
     )
     max_rows: int = Field(default=10000, ge=1, le=100000, description="Maximum rows to return")
     max_execution_time: float = Field(
@@ -110,9 +118,9 @@ class SecurityConfig(BaseSettings):
         default="public", description="Safe search_path to set during query execution"
     )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
+    def parse_string_lists(cls, v: str | list[str]) -> list[str]:
         """Parse comma-separated string or list."""
         if isinstance(v, str):
             return [f.strip() for f in v.split(",") if f.strip()]
@@ -124,9 +132,6 @@ class ValidationConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="VALIDATION_", env_file=_ENV_FILE, extra="ignore")
 
-    max_question_length: int = Field(
-        default=10000, ge=1, le=50000, description="Maximum question length in characters"
-    )
     min_confidence_score: int = Field(
         default=70, ge=0, le=100, description="Minimum confidence score (0-100)"
     )
@@ -142,6 +147,12 @@ class ValidationConfig(BaseSettings):
     confidence_threshold: int = Field(
         default=70, ge=0, le=100, description="Minimum confidence for acceptable results"
     )
+    max_regeneration_attempts: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Max SQL regenerations when result confidence is below threshold",
+    )
 
 
 class CacheConfig(BaseSettings):
@@ -152,7 +163,6 @@ class CacheConfig(BaseSettings):
     schema_ttl: int = Field(
         default=3600, ge=60, le=86400, description="Schema cache TTL in seconds"
     )
-    max_size: int = Field(default=100, ge=1, le=1000, description="Maximum cache entries")
     enabled: bool = Field(default=True, description="Enable schema caching")
 
 
@@ -173,6 +183,15 @@ class ResilienceConfig(BaseSettings):
     )
     circuit_breaker_timeout: float = Field(
         default=60.0, ge=10.0, le=300.0, description="Circuit breaker timeout in seconds"
+    )
+    max_concurrent_queries: int = Field(
+        default=10, ge=1, le=100, description="Maximum concurrent queries"
+    )
+    max_concurrent_llm_calls: int = Field(
+        default=5, ge=1, le=100, description="Maximum concurrent LLM calls"
+    )
+    rate_limit_timeout: float = Field(
+        default=5.0, ge=0.1, le=60.0, description="Seconds to wait for a rate-limit slot"
     )
 
 
@@ -197,6 +216,8 @@ class Settings(BaseSettings):
     """Main application settings aggregating all config sections."""
 
     model_config = SettingsConfigDict(
+        env_prefix="PG_MCP_",
+        env_nested_delimiter="__",
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
@@ -215,6 +236,46 @@ class Settings(BaseSettings):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    # Optional multi-database list (PG_MCP_DATABASES__0__NAME=..., PG_MCP_DATABASES__1__NAME=...)
+    databases: list[DatabaseConfig] = Field(
+        default_factory=list,
+        description="Additional databases; empty list means single-database mode",
+    )
+
+    @field_validator("databases")
+    @classmethod
+    def validate_database_uniqueness(
+        cls, v: list[DatabaseConfig], info: Any
+    ) -> list[DatabaseConfig]:
+        """Ensure database names are unique across the effective database list.
+
+        Args:
+            v: The parsed list of database configs.
+            info: Validation context containing sibling fields.
+
+        Returns:
+            The validated list.
+
+        Raises:
+            ValueError: If duplicate database names are configured.
+        """
+        names = [db.name for db in v]
+        if info.data and "database" in info.data:
+            names.append(info.data["database"].name)
+        if len(names) != len(set(names)):
+            duplicates = {n for n in names if names.count(n) > 1}
+            raise ValueError(f"Duplicate database names configured: {sorted(duplicates)}")
+        return v
+
+    @property
+    def effective_databases(self) -> list[DatabaseConfig]:
+        """Databases to serve: the explicit list if set, else the single database.
+
+        Returns:
+            list[DatabaseConfig]: Effective database configurations.
+        """
+        return self.databases if self.databases else [self.database]
 
     @property
     def is_production(self) -> bool:

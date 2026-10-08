@@ -8,12 +8,21 @@ import os
 import pytest
 
 from pg_mcp.config.settings import reset_settings
+from pg_mcp.observability.metrics import MetricsCollector
 
 
 @pytest.fixture(autouse=True)
 def reset_config() -> None:
     """Reset global settings before each test."""
     reset_settings()
+
+
+@pytest.fixture(autouse=True)
+def reset_metrics_singleton() -> None:
+    """Reset the metrics singleton so counters do not leak between tests."""
+    MetricsCollector._instance = None
+    yield
+    MetricsCollector._instance = None
 
 
 @pytest.fixture(autouse=True)

@@ -8,6 +8,8 @@ import pytest
 
 from pg_mcp.server import lifespan, mcp, query
 
+pytestmark = pytest.mark.integration
+
 
 class TestFullQueryFlow:
     """Integration tests for complete query flow through all components."""

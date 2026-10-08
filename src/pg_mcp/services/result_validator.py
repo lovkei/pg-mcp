@@ -7,7 +7,15 @@ whether query results correctly match the user's original question.
 import json
 from typing import TYPE_CHECKING, Any
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from pg_mcp.config.settings import OpenAIConfig, ValidationConfig
 from pg_mcp.models.errors import LLMError, LLMTimeoutError, LLMUnavailableError
@@ -179,7 +187,9 @@ class ResultValidator:
                 is_acceptable=is_acceptable,
             )
 
-        except TimeoutError as e:
+        except APITimeoutError as e:
+            # openai.APITimeoutError does NOT inherit the built-in TimeoutError,
+            # so this must be caught explicitly (previously a dead branch).
             timeout = self.validation_config.timeout_seconds
             raise LLMTimeoutError(
                 message=f"Result validation timed out after {timeout}s",
@@ -193,23 +203,39 @@ class ResultValidator:
                 suggestion=None,
                 is_acceptable=False,
             )
+        except AuthenticationError as e:
+            raise LLMUnavailableError(
+                message="OpenAI API authentication failed - check API key",
+                retryable=False,
+            ) from e
+        except PermissionDeniedError as e:
+            raise LLMUnavailableError(
+                message="OpenAI API permission denied for this key/model",
+                retryable=False,
+            ) from e
+        except RateLimitError as e:
+            raise LLMUnavailableError(
+                message="OpenAI API rate limit exceeded",
+                retryable=True,
+            ) from e
+        except APIConnectionError as e:
+            raise LLMUnavailableError(
+                message="Cannot connect to OpenAI API",
+                retryable=True,
+            ) from e
+        except APIStatusError as e:
+            if e.status_code >= 500:
+                raise LLMUnavailableError(
+                    message=f"OpenAI API server error (HTTP {e.status_code})",
+                    retryable=True,
+                ) from e
+            raise LLMError(
+                message=f"Result validation failed with status {e.status_code}",
+            ) from e
         except LLMError:
             # Re-raise LLM errors as-is
             raise
         except Exception as e:
-            # Handle various OpenAI errors
-            error_msg = str(e)
-            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API authentication failed - check API key",
-                    details={"error": error_msg},
-                ) from e
-            if "rate_limit" in error_msg.lower():
-                raise LLMUnavailableError(
-                    message="OpenAI API rate limit exceeded",
-                    details={"error": error_msg},
-                ) from e
             raise LLMError(
-                message=f"Result validation failed: {error_msg}",
-                details={"error": error_msg},
+                message=f"Result validation failed: {e}",
             ) from e

@@ -8,13 +8,21 @@ import asyncio
 import datetime
 import decimal
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 from asyncpg import Connection, Pool
 
 from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
+from pg_mcp.resilience.retry import RETRYABLE_DB_EXCEPTIONS, compute_backoff_delay
+
+if TYPE_CHECKING:
+    from pg_mcp.observability.metrics import MetricsCollector
+
+# Connection-level failures get exactly one retry with a short backoff.
+_MAX_CONNECTION_ATTEMPTS = 2
+_CONNECTION_RETRY_BASE_DELAY = 0.2
 
 
 class SQLExecutor:
@@ -37,6 +45,7 @@ class SQLExecutor:
         pool: Pool,
         security_config: SecurityConfig,
         db_config: DatabaseConfig,
+        metrics_collector: "MetricsCollector | None" = None,
     ) -> None:
         """Initialize SQL executor.
 
@@ -44,10 +53,13 @@ class SQLExecutor:
             pool: asyncpg connection pool for database connections.
             security_config: Security configuration including timeouts and limits.
             db_config: Database configuration including connection parameters.
+            metrics_collector: Optional metrics collector for connection and
+                query-duration instrumentation.
         """
         self.pool = pool
         self.security_config = security_config
         self.db_config = db_config
+        self.metrics_collector = metrics_collector
 
     async def execute(
         self,
@@ -91,44 +103,10 @@ class SQLExecutor:
         timeout = timeout or self.security_config.max_execution_time
         max_rows = max_rows or self.security_config.max_rows
 
+        started = asyncio.get_running_loop().time()
         try:
-            async with (
-                self.pool.acquire() as connection,
-                connection.transaction(readonly=True),
-            ):
-                # Set session parameters for security
-                await self._set_session_params(connection, timeout)
-
-                # Execute query with timeout
-                try:
-                    records = await asyncio.wait_for(
-                        connection.fetch(sql),
-                        timeout=timeout,
-                    )
-                except TimeoutError as e:
-                    raise ExecutionTimeoutError(
-                        message=f"Query execution exceeded timeout of {timeout} seconds",
-                        details={
-                            "timeout_seconds": timeout,
-                            "sql": sql[:200],  # Include truncated SQL for debugging
-                        },
-                    ) from e
-
-                # Track total count before limiting
-                total_count = len(records)
-
-                # Limit number of returned rows
-                if len(records) > max_rows:
-                    records = records[:max_rows]
-
-                # Convert asyncpg.Record to dict
-                results = [dict(record) for record in records]
-
-                # Serialize special PostgreSQL types
-                results = self._serialize_results(results)
-
-                return results, total_count
-
+            results, total_count = await self._execute_with_retry(sql, timeout, max_rows)
+            return results, total_count
         except ExecutionTimeoutError:
             # Re-raise timeout errors as-is
             raise
@@ -151,6 +129,103 @@ class SQLExecutor:
                     "error_message": str(e),
                 },
             ) from e
+        finally:
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_db_query_duration(
+                    asyncio.get_running_loop().time() - started
+                )
+
+    async def _execute_with_retry(
+        self,
+        sql: str,
+        timeout: float,  # noqa: ASYNC109
+        max_rows: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Execute once, retrying transient connection failures a single time.
+
+        Args:
+            sql: SQL query to execute (already validated).
+            timeout: Query timeout in seconds.
+            max_rows: Maximum rows to return.
+
+        Returns:
+            tuple: (results, total_row_count).
+
+        Raises:
+            ExecutionTimeoutError: If query execution exceeds timeout.
+            asyncpg.PostgresError: Propagated after the retry budget is spent.
+        """
+        last_error: Exception | None = None
+        for attempt in range(_MAX_CONNECTION_ATTEMPTS):
+            try:
+                return await self._execute_once(sql, timeout, max_rows)
+            except RETRYABLE_DB_EXCEPTIONS as e:
+                last_error = e
+                if attempt + 1 >= _MAX_CONNECTION_ATTEMPTS:
+                    raise
+                await asyncio.sleep(
+                    compute_backoff_delay(
+                        attempt, _CONNECTION_RETRY_BASE_DELAY, backoff_factor=2.0
+                    )
+                )
+        raise AssertionError(f"unreachable: {last_error}")  # pragma: no cover
+
+    async def _execute_once(
+        self,
+        sql: str,
+        timeout: float,  # noqa: ASYNC109
+        max_rows: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Run a single attempt with a read-only transaction.
+
+        Args:
+            sql: SQL query to execute (already validated).
+            timeout: Query timeout in seconds.
+            max_rows: Maximum rows to return.
+
+        Returns:
+            tuple: (results, total_row_count).
+
+        Raises:
+            ExecutionTimeoutError: If query execution exceeds timeout.
+            asyncpg.PostgresError: If the database operation fails.
+        """
+        async with (
+            self.pool.acquire() as connection,
+            connection.transaction(readonly=True),
+        ):
+            # Set session parameters for security
+            await self._set_session_params(connection, timeout)
+
+            # Execute query with timeout
+            try:
+                records = await asyncio.wait_for(
+                    connection.fetch(sql),
+                    timeout=timeout,
+                )
+            except TimeoutError as e:
+                raise ExecutionTimeoutError(
+                    message=f"Query execution exceeded timeout of {timeout} seconds",
+                    details={
+                        "timeout_seconds": timeout,
+                        "sql": sql[:200],  # Include truncated SQL for debugging
+                    },
+                ) from e
+
+            # Track total count before limiting
+            total_count = len(records)
+
+            # Limit number of returned rows
+            if len(records) > max_rows:
+                records = records[:max_rows]
+
+            # Convert asyncpg.Record to dict
+            results = [dict(record) for record in records]
+
+            # Serialize special PostgreSQL types
+            results = self._serialize_results(results)
+
+            return results, total_count
 
     async def _set_session_params(
         self,

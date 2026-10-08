@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pg-mcp 控制台</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #1a1d27; --panel2: #222634; --border: #2e3345;
+    --text: #e6e9f0; --dim: #8b91a5; --accent: #5b8def; --green: #3fb96f;
+    --red: #e0565f; --yellow: #e0b04f; --mono: "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 24px; max-width: 1080px; margin: 0 auto;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 20px; font-weight: 600; }
+  h1 .tag {
+    font-size: 11px; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 4px; padding: 1px 6px; vertical-align: 3px; margin-left: 8px;
+  }
+  .conn { font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--red); margin-right: 5px; }
+  .dot.ok { background: var(--green); }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 13px; color: var(--dim); font-weight: 500; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
+  textarea {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font: 14px var(--mono); resize: vertical; min-height: 64px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 10px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
+  select, input {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 9px 22px; font: 14px/1 inherit; cursor: pointer; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .5; cursor: wait; }
+  button.ghost { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); font-weight: 400; }
+  .presets { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .presets button { padding: 5px 12px; font-size: 12px; font-weight: 400; }
+  .status { font-size: 13px; }
+  .status.ok { color: var(--green); } .status.err { color: var(--red); } .status.warn { color: var(--yellow); }
+  .meta { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .meta b { color: var(--text); font-weight: 600; }
+  pre {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; font: 12.5px/1.55 var(--mono); overflow-x: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .sql { color: #9fd0ff; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 4px; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  th { background: var(--panel2); color: var(--dim); font-weight: 500; font-family: var(--mono); font-size: 12px; }
+  td { font-family: var(--mono); }
+  .bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .bar i { display: block; height: 100%; background: var(--green); border-radius: 3px; transition: width .4s; }
+  .bar i.low { background: var(--yellow); }
+  .hidden { display: none; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--dim); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  footer { text-align: center; color: var(--dim); font-size: 12px; margin-top: 24px; }
+  footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PostgreSQL MCP 控制台<span class="tag">pg-mcp</span></h1>
+  <span class="conn"><span class="dot" id="dot"></span><span id="connText">未连接</span></span>
+</header>
+
+<div class="card">
+  <h2>自然语言查询</h2>
+  <textarea id="question" placeholder="例如：数据库里有多少个用户？">数据库里有多少个用户？</textarea>
+  <div class="presets">
+    <button onclick="preset('数据库里有多少个用户？')">用户总数</button>
+    <button onclick="preset('查询所有用户的邮箱和注册时间')">用户明细</button>
+    <button onclick="preset('有多少篇文章？按发布时间倒序列出标题')">文章列表</button>
+    <button onclick="preset('删除所有用户数据')">🚫 危险请求（应被拦截）</button>
+    <button onclick="preset('EXPLAIN SELECT 1')">🚫 EXPLAIN（默认拒绝）</button>
+  </div>
+  <div class="row">
+    <label style="color:var(--dim);font-size:13px">数据库</label>
+    <input id="database" placeholder="(默认)" style="width:130px">
+    <label style="color:var(--dim);font-size:13px">返回类型</label>
+    <select id="returnType">
+      <option value="result">result（执行并返回数据）</option>
+      <option value="sql">sql（仅生成 SQL）</option>
+    </select>
+    <button id="askBtn" onclick="ask()">查询</button>
+    <span id="elapsed" class="status"></span>
+  </div>
+</div>
+
+<div class="card hidden" id="respCard">
+  <h2>响应</h2>
+  <div class="meta" id="meta"></div>
+  <div id="confidence"></div>
+  <div id="warning" class="status warn hidden" style="margin:8px 0"></div>
+  <div id="sqlWrap" class="hidden" style="margin:10px 0">
+    <h2 style="margin-bottom:6px">生成的 SQL</h2>
+    <pre id="sqlOut" class="sql"></pre>
+  </div>
+  <div id="tableWrap" class="hidden" style="margin:10px 0">
+    <h2 style="margin-bottom:6px">查询结果</h2>
+    <div id="tableOut" style="overflow-x:auto"></div>
+  </div>
+  <div id="errWrap" class="hidden" style="margin:10px 0">
+    <h2 style="margin-bottom:6px">错误</h2>
+    <pre id="errOut" style="border-color:var(--red)"></pre>
+  </div>
+</div>
+
+<div class="card">
+  <h2>原始 JSON</h2>
+  <pre id="raw">等待查询…</pre>
+</div>
+
+<footer>
+  MCP endpoint: <a href="http://127.0.0.1:8000/mcp" target="_blank">http://127.0.0.1:8000/mcp</a>
+  &nbsp;·&nbsp; Prometheus: <a href="http://127.0.0.1:9090/metrics" target="_blank">http://127.0.0.1:9090/metrics</a>
+  &nbsp;·&nbsp; request_id 会贯穿服务端日志
+</footer>
+
+<script>
+const MCP = "http://127.0.0.1:8000/mcp";
+let sessionId = null, msgId = 0;
+
+async function rpc(method, params, retry = true) {
+  const res = await fetch(MCP, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}) },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++msgId, method, params }),
+  });
+  if (res.status === 404) { sessionId = null; throw new Error("会话过期，请重试"); }
+  const sid = res.headers.get("mcp-session-id");
+  if (sid) sessionId = sid;
+  const text = await res.text();
+  // 会话丢失（服务器重启）时重新 initialize 一次再重放
+  if (res.status === 400 && text.includes("Missing session ID") && retry && sessionId) {
+    sessionId = null;
+    await connect();
+    return rpc(method, params, false);
+  }
+  let data = null;
+  try {
+    for (const line of text.split("\n")) {
+      if (line.startsWith("data:")) data = JSON.parse(line.slice(5));
+    }
+    if (!data) data = JSON.parse(text);
+  } catch {
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.result;
+}
+
+async function connect() {
+  try {
+    await rpc("initialize", {
+      protocolVersion: "2024-11-05", capabilities: {},
+      clientInfo: { name: "pg-mcp-console", version: "1.0" },
+    });
+    await fetch(MCP, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                 ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}) },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
+    document.getElementById("dot").classList.add("ok");
+    document.getElementById("connText").textContent = "已连接 · " + MCP;
+  } catch (e) {
+    document.getElementById("connText").textContent = "连接失败: " + e.message;
+    setTimeout(connect, 3000);
+  }
+}
+
+function preset(q) { document.getElementById("question").value = q; }
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+function renderTable(data) {
+  if (!data || !data.rows) return;
+  const t = document.createElement("table");
+  t.innerHTML = "<tr>" + data.columns.map(c => `<th>${esc(c)}</th>`).join("") + "</tr>"
+    + data.rows.map(r => "<tr>" + data.columns.map(c => `<td>${esc(r[c] ?? "NULL")}</td>`).join("") + "</tr>").join("");
+  document.getElementById("tableOut").innerHTML = "";
+  document.getElementById("tableOut").appendChild(t);
+}
+
+async function ask() {
+  const btn = document.getElementById("askBtn");
+  const elapsedEl = document.getElementById("elapsed");
+  btn.disabled = true;
+  elapsedEl.innerHTML = '<span class="spinner"></span>LLM 生成 SQL 并执行中（通常 10~60 秒）…';
+  const t0 = performance.now();
+
+  try {
+    const args = { question: document.getElementById("question").value.trim(),
+                   return_type: document.getElementById("returnType").value };
+    const db = document.getElementById("database").value.trim();
+    if (db) args.database = db;
+
+    const result = await rpc("tools/call", { name: "query", arguments: args });
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    elapsedEl.innerHTML = `耗时 <b>${secs}s</b>`;
+    const resp = JSON.parse(result.content[0].text);
+
+    document.getElementById("respCard").classList.remove("hidden");
+    document.getElementById("raw").textContent = JSON.stringify(resp, null, 2);
+
+    document.getElementById("meta").innerHTML =
+      `<span>success <b style="color:${resp.success ? "var(--green)" : "var(--red)"}">${resp.success}</b></span>` +
+      `<span>request_id <b>${esc(resp.request_id || "-")}</b></span>` +
+      `<span>tokens_used <b>${resp.tokens_used ?? 0}</b></span>` +
+      `<span>confidence <b>${resp.confidence ?? "-"}</b></span>`;
+
+    const conf = document.getElementById("confidence");
+    if (resp.confidence != null) {
+      conf.innerHTML = `<div class="bar"><i class="${resp.confidence < 70 ? "low" : ""}" style="width:${resp.confidence}%"></i></div>`;
+    } else conf.innerHTML = "";
+
+    const warn = document.getElementById("warning");
+    if (resp.warning) { warn.textContent = "⚠ " + resp.warning; warn.classList.remove("hidden"); }
+    else warn.classList.add("hidden");
+
+    const sqlWrap = document.getElementById("sqlWrap");
+    if (resp.generated_sql) { document.getElementById("sqlOut").textContent = resp.generated_sql; sqlWrap.classList.remove("hidden"); }
+    else sqlWrap.classList.add("hidden");
+
+    const tableWrap = document.getElementById("tableWrap");
+    if (resp.data && resp.data.rows) { renderTable(resp.data); tableWrap.classList.remove("hidden"); }
+    else tableWrap.classList.add("hidden");
+
+    const errWrap = document.getElementById("errWrap");
+    if (resp.error) {
+      document.getElementById("errOut").textContent =
+        resp.error.code + ": " + (resp.error.message || "") +
+        (resp.error.details ? "\n" + JSON.stringify(resp.error.details, null, 2) : "");
+      errWrap.classList.remove("hidden");
+    } else errWrap.classList.add("hidden");
+  } catch (e) {
+    document.getElementById("respCard").classList.remove("hidden");
+    document.getElementById("raw").textContent = "请求失败: " + e.message;
+    elapsedEl.innerHTML = '<span class="status err">失败</span>';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+connect();
+</script>
+</body>
+</html>

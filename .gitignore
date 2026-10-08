@@ -57,6 +57,12 @@ dmypy.json
 .env.local
 .env.*.local
 
+# Local machine-specific MCP config (contains real API keys)
+.mcp.json
+
+# Coverage artifacts
+coverage.json
+
 # Logs
 *.log
 logs/

@@ -4,7 +4,9 @@ This module implements comprehensive metrics collection using prometheus_client,
 tracking query requests, LLM calls, database operations, and system health.
 """
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+import contextlib
+
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram, start_http_server
 
 
 class MetricsCollector:
@@ -40,8 +42,16 @@ class MetricsCollector:
         """Initialize all Prometheus metrics.
 
         Creates counters, histograms, and gauges for tracking various
-        aspects of the MCP server operation.
+        aspects of the MCP server operation. Any metric left over from a
+        previous instance in this process is unregistered first so that
+        re-initialization (tests, resets) cannot collide with the global
+        collector registry.
         """
+        # Drop stale collectors from a previous instance (if any).
+        for collector in list(REGISTRY._collector_to_names):
+            with contextlib.suppress(KeyError, ValueError):
+                REGISTRY.unregister(collector)
+
         # Query Metrics
         self.query_requests: Counter = Counter(
             "pg_mcp_query_requests_total",

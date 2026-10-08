@@ -5,13 +5,17 @@ It ensures that only safe, read-only queries are executed and blocks potentially
 dangerous operations.
 """
 
-from typing import ClassVar
+import re
+from typing import TYPE_CHECKING, ClassVar
 
 import sqlglot
 from sqlglot import exp
 
 from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
+
+if TYPE_CHECKING:
+    from pg_mcp.observability.metrics import MetricsCollector
 
 
 class SQLValidator:
@@ -28,11 +32,6 @@ class SQLValidator:
     # Allowed statement types at the top level (including set operations)
     ALLOWED_STATEMENT_TYPES: ClassVar = {
         exp.Select, exp.Union, exp.Intersect, exp.Except
-    }
-
-    # Allowed top-level expressions (including CTEs)
-    ALLOWED_TOP_LEVEL: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except, exp.With, exp.Subquery
     }
 
     # Forbidden statement types
@@ -74,12 +73,21 @@ class SQLValidator:
         "copy_to",
     }
 
+    # Matches an EXPLAIN prefix: EXPLAIN [ANALYZE] [VERBOSE] [(options)] target.
+    # Must also match a bare "EXPLAIN" (no inner statement) so the empty-inner
+    # guard runs instead of leaving the prefix in place (which would recurse).
+    _EXPLAIN_PREFIX_RE = re.compile(
+        r"^\s*explain\b[ \t]*(?:analyze\b[ \t]*|analyse\b[ \t]*|verbose\b[ \t]*|\(.*?\)[ \t]*)*",
+        re.IGNORECASE | re.DOTALL,
+    )
+
     def __init__(
         self,
         config: SecurityConfig,
         blocked_tables: list[str] | None = None,
         blocked_columns: list[str] | None = None,
         allow_explain: bool = False,
+        metrics_collector: "MetricsCollector | None" = None,
     ) -> None:
         """Initialize SQL validator.
 
@@ -88,16 +96,27 @@ class SQLValidator:
             blocked_tables: Optional list of table names to block access to.
             blocked_columns: Optional list of column names to block access to.
             allow_explain: Whether to allow EXPLAIN statements.
+            metrics_collector: Optional metrics collector for rejection counters.
         """
         self.config = config
         self.blocked_tables = {t.lower() for t in (blocked_tables or [])}
         self.blocked_columns = {c.lower() for c in (blocked_columns or [])}
         self.allow_explain = allow_explain
+        self._metrics = metrics_collector
 
         # Combine built-in dangerous functions with custom blocked functions
         self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
             f.lower() for f in config.blocked_functions
         }
+
+    def _record_rejection(self, reason: str) -> None:
+        """Increment the sql_rejected metric with a reason label if metrics are enabled.
+
+        Args:
+            reason: Rejection reason label (statement_type, blocked_function, ...).
+        """
+        if self._metrics is not None:
+            self._metrics.increment_sql_rejected(reason)
 
     def validate(self, sql: str) -> tuple[bool, str | None]:
         """Validate SQL query for security compliance.
@@ -132,21 +151,25 @@ class SQLValidator:
         try:
             parsed = sqlglot.parse(sql, read="postgres")
         except Exception as e:
+            self._record_rejection("parse_error")
             raise SQLParseError(f"Failed to parse SQL: {e}") from e
 
         # Check for multiple statements
         if len(parsed) > 1:
+            self._record_rejection("multi_statement")
             raise SecurityViolationError(
                 "Multiple statements not allowed. Only single SELECT queries are permitted."
             )
 
         if not parsed:
+            self._record_rejection("parse_error")
             raise SQLParseError("No valid SQL statement found")
 
         statement = parsed[0]
 
         # Check for null or empty statement (e.g., comment-only SQL)
         if statement is None or isinstance(statement, type(None)):
+            self._record_rejection("parse_error")
             raise SQLParseError("No valid SQL statement found")
 
         # Handle EXPLAIN statements (parsed as Command in sqlglot 28.5.0)
@@ -155,14 +178,21 @@ class SQLValidator:
             cmd_name = str(statement.this).upper() if statement.this else ""
             if cmd_name == "EXPLAIN":
                 if not self.allow_explain:
+                    self._record_rejection("statement_type")
                     raise SecurityViolationError("EXPLAIN statements are not allowed")
-                # EXPLAIN is read-only and safe - it only shows query plans without executing.
-                # sqlglot 28.5.0 cannot parse EXPLAIN syntax reliably (falls back to Command),
-                # so we don't attempt to validate the inner query string to avoid false positives.
-                # Even "EXPLAIN DELETE" is safe as it won't actually delete data.
+                # EXPLAIN ANALYZE / EXPLAIN (ANALYZE ...) actually EXECUTE the inner
+                # statement, so the inner query must go through the full validation
+                # pipeline. Strip the EXPLAIN prefix and validate the remainder:
+                # "EXPLAIN DELETE FROM users" -> "DELETE FROM users" is rejected.
+                inner_sql = self._EXPLAIN_PREFIX_RE.sub("", sql, count=1)
+                if not inner_sql.strip():
+                    self._record_rejection("parse_error")
+                    raise SQLParseError("EXPLAIN has no statement to explain")
+                self.validate_or_raise(inner_sql)
                 return None
             else:
                 # Other commands are not allowed
+                self._record_rejection("statement_type")
                 raise SecurityViolationError(
                     f"Command '{cmd_name}' is not allowed. Only SELECT queries are permitted."
                 )
@@ -179,18 +209,23 @@ class SQLValidator:
 
         # Perform security checks
         if error := self._check_statement_type(main_query):
+            self._record_rejection("statement_type")
             raise SecurityViolationError(error)
 
         if error := self._check_dangerous_functions(statement):
+            self._record_rejection("blocked_function")
             raise SecurityViolationError(error)
 
         if error := self._check_blocked_tables(statement):
+            self._record_rejection("blocked_table")
             raise SecurityViolationError(error)
 
         if error := self._check_blocked_columns(statement):
+            self._record_rejection("blocked_column")
             raise SecurityViolationError(error)
 
         if error := self._check_subquery_safety(statement):
+            self._record_rejection("subquery")
             raise SecurityViolationError(error)
 
     def _check_statement_type(self, statement: exp.Expression) -> str | None:
@@ -236,6 +271,10 @@ class SQLValidator:
     def _check_blocked_tables(self, statement: exp.Expression) -> str | None:
         """Check for access to blocked tables.
 
+        A bare config entry (e.g. ``users``) matches both the bare name and any
+        schema-qualified reference (``public.users``, ``other.users``). A
+        qualified config entry (``public.users``) only matches that exact form.
+
         Args:
             statement: Parsed SQL statement.
 
@@ -248,9 +287,16 @@ class SQLValidator:
         # Find all table references
         for table in statement.find_all(exp.Table):
             table_name = table.name.lower() if table.name else ""
+            if not table_name:
+                continue
+
+            schema_name = (table.db or "").lower()
+            qualified_name = f"{schema_name}.{table_name}" if schema_name else None
 
             if table_name in self.blocked_tables:
-                return f"Access to table '{table_name}' is not allowed"
+                return f"Access to table '{qualified_name or table_name}' is not allowed"
+            if qualified_name and qualified_name in self.blocked_tables:
+                return f"Access to table '{qualified_name}' is not allowed"
 
         return None
 
