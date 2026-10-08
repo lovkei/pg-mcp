@@ -42,7 +42,11 @@ class SQLGenerator:
             config: OpenAI configuration including API key and model settings.
         """
         self.config = config
-        self.client = AsyncOpenAI(api_key=config.api_key.get_secret_value(), timeout=config.timeout)
+        self.client = AsyncOpenAI(
+            api_key=config.api_key.get_secret_value(),
+            base_url=config.base_url,
+            timeout=config.timeout,
+        )
 
     async def generate(
         self,

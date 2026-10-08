@@ -55,6 +55,7 @@ class ResultValidator:
         self.validation_config = validation_config
         self.client = AsyncOpenAI(
             api_key=openai_config.api_key.get_secret_value(),
+            base_url=openai_config.base_url,
             timeout=validation_config.timeout_seconds,
         )
 

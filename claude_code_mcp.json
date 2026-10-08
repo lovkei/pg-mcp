@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "pg-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/rzx/Downloads/geektime-bootcamp-ai-master/w5/pg-mcp",
+        "run",
+        "python",
+        "-m",
+        "pg_mcp"
+      ],
+      "env": {
+        "DATABASE_HOST": "localhost",
+        "DATABASE_PORT": "5432",
+        "DATABASE_NAME": "blog_small",
+        "DATABASE_USER": "postgres",
+        "DATABASE_PASSWORD": "postgres",
+        "DATABASE_MIN_POOL_SIZE": "2",
+        "DATABASE_MAX_POOL_SIZE": "10",
+        "OPENAI_API_KEY": "填入你的-key",
+        "OPENAI_BASE_URL": "http://10.11.203.232:3030/v1",
+        "OPENAI_MODEL": "glm-4.7",
+        "OPENAI_MAX_TOKENS": "8000",
+        "OBSERVABILITY_METRICS_ENABLED": "false",
+        "OBSERVABILITY_LOG_FORMAT": "text",
+        "ENVIRONMENT": "development"
+      }
+    }
+  }
+}

@@ -28,7 +28,7 @@ class TestDatabaseConfig:
 
     def test_default_values(self) -> None:
         """Test default configuration values."""
-        config = DatabaseConfig()
+        config = DatabaseConfig(_env_file=None)
         assert config.host == "localhost"
         assert config.port == 5432
         assert config.name == "postgres"
@@ -99,7 +99,7 @@ class TestOpenAIConfig:
 
     def test_default_values(self) -> None:
         """Test default configuration values."""
-        config = OpenAIConfig(api_key="sk-test123")
+        config = OpenAIConfig(api_key="sk-test123", _env_file=None)
         assert config.model == "gpt-4o-mini"
         assert config.max_tokens == 2000
         assert config.temperature == 0.0
@@ -140,7 +140,7 @@ class TestOpenAIConfig:
             OpenAIConfig(api_key="sk-test", max_tokens=50)
 
         with pytest.raises(ValidationError):
-            OpenAIConfig(api_key="sk-test", max_tokens=5000)
+            OpenAIConfig(api_key="sk-test", max_tokens=200000)
 
     def test_invalid_temperature(self) -> None:
         """Test invalid temperature is rejected."""
@@ -287,7 +287,7 @@ class TestObservabilityConfig:
 
     def test_default_values(self) -> None:
         """Test default configuration values."""
-        config = ObservabilityConfig()
+        config = ObservabilityConfig(_env_file=None)
         # metrics_enabled 在测试环境可能被禁用以避免启动 HTTP 服务器
         # 生产环境应该通过环境变量显式设置
         assert config.metrics_port == 9090
